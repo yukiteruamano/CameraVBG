@@ -120,6 +120,36 @@ def color_transfer(source, target, intensity=0.3):
 def sigmoid(x, slope, shift):
     return 1 / (1 + np.exp(-slope * (x - shift)))
 
+def wait_for_camera_ready(vs, max_attempts=10, initial_delay=0.2):
+    """
+    Espera de manera inteligente a que la cámara esté lista.
+    Reemplaza el time.sleep(1.0) fijo con un enfoque más adaptativo.
+
+    Args:
+        vs: WebcamStream instance
+        max_attempts: Número máximo de intentos
+        initial_delay: Delay inicial en segundos
+
+    Returns:
+        bool: True si la cámara está lista, False si falló
+    """
+    time.sleep(initial_delay)  # Pequeño delay inicial
+
+    for attempt in range(max_attempts):
+        frame = vs.read()
+        if frame is not None and frame.size > 0:
+            # Verificamos que el frame tenga dimensiones válidas
+            h, w = frame.shape[:2]
+            if h > 0 and w > 0:
+                print(f"Cámara lista: {w}x{h} @ {attempt + 1} intentos")
+                return True
+
+        if attempt < max_attempts - 1:
+            time.sleep(0.1)  # Pequeño delay entre intentos
+
+    print("Advertencia: Cámara no respondió correctamente")
+    return False
+
 
 def apply_light_wrap(foreground, background, mask, radius=20):
     """Efecto de envoltura de luz en los bordes"""
@@ -167,8 +197,9 @@ args = parser.parse_args()
 
 def main():
     if not HAS_MEDIAPIPE:
+        print("Error. No está instalado MediaPipe")
         return
-
+    
     try:
         engine = MediaPipeEngine(args.model_path)
     except Exception as e:
@@ -177,26 +208,49 @@ def main():
 
     print("Iniciando cámara...")
     vs = WebcamStream(src=args.cam).start()
-    time.sleep(1.0)
+    
+    # Espera inteligente para que la cámara esté lista
+    camera_ready = wait_for_camera_ready(vs)
+    if not camera_ready:
+        print("Continuando con valores por defecto...")
 
-    bg_image_source = cv2.imread(args.bg_img) if args.bg_img else None
+    # Virtual Cam Init
+    cam_out = None
+    if args.virtual and HAS_VIRTUAL_CAM:
+        frame_test = vs.read()
+        
+        if frame_test is not None:
+            h, w = frame_test.shape[:2]
+            print(f"Resolucion Vcam: {w}x{h}")
+        else:
+            print("Advertencia: No se pudo obtener frame de prueba, usando valores por defecto")
+            h, w = 720, 1280 # Fallback por si la cámara tarda en iniciar
+
+        cam_out = pyvirtualcam.Camera(
+                width=w, height=h, fps=30, fmt=pyvirtualcam.PixelFormat.BGR
+            )
+        print("--> VIRTUAL CAM ACTIVA")
+
+    if args.bg_img:
+        # Cargamos la imagen
+        bg_image_source = cv2.imread(args.bg_img) 
+        if bg_image_source is not None:
+            # Redimensionamos AL INICIO para que el bucle no tenga que calcular 
+            # interpolación en cada frame. Esto convierte el 'resize' del bucle
+            # en una operación casi gratuita.
+            bg_image_source = cv2.resize(bg_image_source, (w, h))
+        else:
+            bg_image_source = None
+            print(f"Error: No se pudo cargar {args.bg_img}")
+    else:
+        bg_image_source = None
+
     previous_mask_stable = None
     morph_kernel = (
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.morph, args.morph))
         if args.morph > 0
         else None
     )
-
-    # Virtual Cam Init
-    cam_out = None
-    if args.virtual and HAS_VIRTUAL_CAM:
-        frame_test = vs.read()
-        if frame_test is not None:
-            h, w, _ = frame_test.shape
-            cam_out = pyvirtualcam.Camera(
-                width=w, height=h, fps=30, fmt=pyvirtualcam.PixelFormat.BGR
-            )
-            print("--> VIRTUAL CAM ACTIVA")
 
     use_guided = args.guided and HAS_GUIDED_FILTER
     print("SYSTEM ONLINE. Backend: MEDIAPIPE")
