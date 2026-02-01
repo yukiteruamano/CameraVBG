@@ -1,0 +1,32 @@
+[project]
+name = "cameravbg"
+version = "0.1.0"
+description = "Virtual camera using MediaPipe models"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mediapipe>=0.10.32",
+    "numpy>=2.3.5",
+    "opencv-contrib-python>=4.13.0.90",
+    "opencv-python>=4.13.0.90",
+    "pyvirtualcam>=0.15.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+[dependency-groups]
+dev = [
+    "isort>=7.0.0",
+]
+
