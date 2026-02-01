@@ -90,22 +90,26 @@ class MediaPipeEngine:
 
 def color_transfer(source, target, intensity=0.3):
     """Armonización de color entre el sujeto y el fondo"""
+    # source y target entran como uint8 BGR
     source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
     target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
 
+    # meanStdDev devuelve float64 (double)
     (l_mean_src, l_std_src) = cv2.meanStdDev(source_lab)
     (l_mean_tar, l_std_tar) = cv2.meanStdDev(target_lab)
 
-    l, a, b = cv2.split(source_lab)
+    l, a, b = cv2.split(source_lab) # Estos son float32
 
     def scale_channel(ch, m_src, s_src, m_tar, s_tar):
         s_src = max(s_src, 1e-5)
         new_ch = (ch - m_src) * (s_tar / s_src) + m_tar
         return np.clip(new_ch, 0, 255)
 
-    a_new = scale_channel(a, l_mean_src[1], l_std_src[1], l_mean_tar[1], l_std_tar[1])
-    b_new = scale_channel(b, l_mean_src[2], l_std_src[2], l_mean_tar[2], l_std_tar[2])
+    # CORRECCIÓN: Forzamos .astype(np.float32) porque scale_channel devolvía float64
+    a_new = scale_channel(a, l_mean_src[1], l_std_src[1], l_mean_tar[1], l_std_tar[1]).astype(np.float32)
+    b_new = scale_channel(b, l_mean_src[2], l_std_src[2], l_mean_tar[2], l_std_tar[2]).astype(np.float32)
 
+    # Ahora ambos inputs son float32
     a_final = cv2.addWeighted(a_new, intensity, a, 1 - intensity, 0)
     b_final = cv2.addWeighted(b_new, intensity, b, 1 - intensity, 0)
 
