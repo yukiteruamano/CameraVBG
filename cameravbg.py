@@ -11,6 +11,7 @@ try:
     import mediapipe as mp
     from mediapipe.tasks import python as mppython
     from mediapipe.tasks.python import vision as mpvision
+
     HAS_MEDIAPIPE = True
 except ImportError:
     HAS_MEDIAPIPE = False
@@ -18,6 +19,7 @@ except ImportError:
 
 try:
     import pyvirtualcam
+
     HAS_VIRTUAL_CAM = True
 except ImportError:
     HAS_VIRTUAL_CAM = False
@@ -30,6 +32,7 @@ except AttributeError:
 
 
 # --- CLASES ---
+
 
 class WebcamStream:
     def __init__(self, src=0):
@@ -45,7 +48,8 @@ class WebcamStream:
 
     def update(self):
         while True:
-            if self.stopped: return
+            if self.stopped:
+                return
             (self.grabbed, self.frame) = self.stream.read()
 
     def read(self):
@@ -54,6 +58,7 @@ class WebcamStream:
     def stop(self):
         self.stopped = True
         self.stream.release()
+
 
 class MediaPipeEngine:
     def __init__(self, model_path="models/selfie_segmenter.tflite"):
@@ -76,8 +81,10 @@ class MediaPipeEngine:
     def close(self):
         self.segmenter.close()
 
+
 class FrameManager:
     """Gestor de frames optimizado"""
+
     def __init__(self, frame_skip=0, skip_non_essential=False):
         self.frame_skip = frame_skip
         self.skip_non_essential = skip_non_essential
@@ -88,49 +95,64 @@ class FrameManager:
 
     def should_run_inference(self):
         """Devuelve True si se debe ejecutar la IA en este frame"""
-        if self.frame_skip <= 0: return True
+        if self.frame_skip <= 0:
+            return True
         # Si frame_skip es 2: Ejecuta en 0, 2, 4... (Salta 1)
         # Si frame_skip es 3: Ejecuta en 0, 3, 6... (Salta 2)
         return (self.frame_counter % self.frame_skip) == 0
 
     def should_run_effects(self):
         """Devuelve True si se deben ejecutar efectos pesados (LightWrap, etc)"""
-        if not self.skip_non_essential: return True
+        if not self.skip_non_essential:
+            return True
         # Si estamos saltando inferencia, también saltamos efectos pesados
         # para maximizar FPS en los frames intermedios
         return self.should_run_inference()
 
+
 # --- FUNCIONES AUXILIARES ---
 
-def color_transfer(source, target, intensity=0.3):
-    # source y target entran como uint8 BGR
-    source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
-    target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
 
+def color_transfer(source, target_stats, intensity=0.3):
+    """
+    source: Frame de la cámara (uint8 BGR)
+    target_stats: Tupla (mean, std) pre-calculada del fondo en espacio LAB
+    """
+    (l_mean_tar, l_std_tar) = target_stats
+
+    # Convertimos solo el frame actual a LAB
+    source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
     (l_mean_src, l_std_src) = cv2.meanStdDev(source_lab)
-    (l_mean_tar, l_std_tar) = cv2.meanStdDev(target_lab)
 
     l, a, b = cv2.split(source_lab)
 
     def scale_channel(ch, m_src, s_src, m_tar, s_tar):
+        # Evitamos división por cero
         s_src = max(s_src, 1e-5)
         new_ch = (ch - m_src) * (s_tar / s_src) + m_tar
         return np.clip(new_ch, 0, 255)
 
-    a_new = scale_channel(a, l_mean_src[1], l_std_src[1], l_mean_tar[1], l_std_tar[1]).astype(np.float32)
-    b_new = scale_channel(b, l_mean_src[2], l_std_src[2], l_mean_tar[2], l_std_tar[2]).astype(np.float32)
+    # Aplicamos el escalado solo a los canales A y B (el color)
+    # El canal L (luminosidad) lo dejamos intacto o lo escalamos suavemente si prefieres
+    a_new = scale_channel(a, l_mean_src[1], l_std_src[1], l_mean_tar[1], l_std_tar[1])
+    b_new = scale_channel(b, l_mean_src[2], l_std_src[2], l_mean_tar[2], l_std_tar[2])
 
-    a_final = cv2.addWeighted(a_new, intensity, a, 1 - intensity, 0)
-    b_final = cv2.addWeighted(b_new, intensity, b, 1 - intensity, 0)
+    # Mezclamos con el original según la intensidad
+    a_final = cv2.addWeighted(a_new.astype(np.float32), intensity, a, 1 - intensity, 0)
+    b_final = cv2.addWeighted(b_new.astype(np.float32), intensity, b, 1 - intensity, 0)
 
     merged = cv2.merge([l, a_final, b_final])
     return cv2.cvtColor(merged.astype("uint8"), cv2.COLOR_LAB2BGR)
 
+
 def sigmoid(x, slope, shift):
     return 1 / (1 + np.exp(-slope * (x - shift)))
 
+
 def wait_for_camera_ready(vs, max_attempts=10):
     time.sleep(0.5)
+    attempt = 0
+
     for attempt in range(max_attempts):
         frame = vs.read()
         if frame is not None and frame.size > 0:
@@ -139,22 +161,27 @@ def wait_for_camera_ready(vs, max_attempts=10):
                 print(f"Cámara lista: {w}x{h}")
                 return True
         time.sleep(0.2)
+        attempt = attempt + 1
     return False
 
-def apply_light_wrap(foreground, background, mask, radius=20):
+
+def apply_light_wrap(foreground, bg_blurred, mask, radius=20):
     mask_inv = 1.0 - mask
     k = radius if radius % 2 == 1 else radius + 1
-    # Blur es pesado, solo se ejecuta si se llama a la función
+
+    # El desenfoque de la máscara SÍ debe ser interno porque la máscara cambia
     mask_inv_blurred = cv2.GaussianBlur(mask_inv, (k, k), 0)
     wrap_map = mask * mask_inv_blurred
-    
+
     if len(wrap_map.shape) == 2:
         wrap_map = wrap_map[:, :, np.newaxis]
 
-    bg_blur = cv2.GaussianBlur(background, (k, k), 0)
-    
-    return (foreground.astype(np.float32) * (1.0 - wrap_map) + 
-            bg_blur.astype(np.float32) * wrap_map).astype(np.uint8)
+    # Usamos bg_blurred que ya viene procesado de afuera
+    return (
+        foreground.astype(np.float32) * (1.0 - wrap_map)
+        + bg_blurred.astype(np.float32) * wrap_map
+    ).astype(np.uint8)
+
 
 # --- CLI ---
 parser = argparse.ArgumentParser()
@@ -170,13 +197,17 @@ parser.add_argument("--blur", type=int, default=7)
 parser.add_argument("--guided", action="store_true")
 parser.add_argument("--light_wrap", type=int, default=20)
 parser.add_argument("--harmonize", type=float, default=0.0)
-parser.add_argument("--frame_skip", type=int, default=0, help="Saltar inferencia cada N frames (Ej: 2)")
+parser.add_argument(
+    "--frame_skip", type=int, default=0, help="Saltar inferencia cada N frames (Ej: 2)"
+)
 parser.add_argument("--skip_non_essential", action="store_true")
 
 args = parser.parse_args()
 
+
 def main():
-    if not HAS_MEDIAPIPE: return
+    if not HAS_MEDIAPIPE:
+        return
     try:
         engine = MediaPipeEngine(args.model_path)
     except Exception as e:
@@ -196,69 +227,96 @@ def main():
     # VCam
     cam_out = None
     if args.virtual and HAS_VIRTUAL_CAM:
-        cam_out = pyvirtualcam.Camera(width=w_orig, height=h_orig, fps=30, fmt=pyvirtualcam.PixelFormat.BGR)
+        cam_out = pyvirtualcam.Camera(
+            width=w_orig, height=h_orig, fps=30, fmt=pyvirtualcam.PixelFormat.BGR
+        )
         print("--> VIRTUAL CAM ACTIVA")
 
-    # PREPARACIÓN DE FONDO (Optimización: FUERA DEL BUCLE)
+    # --- PREPARACIÓN DE FONDO OPTIMIZADA ---
     bg_image_ready = None
+    bg_blurred_light_wrap = None
+    bg_stats = None
+
     if args.bg_img:
         bg_raw = cv2.imread(args.bg_img)
         if bg_raw is not None:
-            # Redimensionamos UNA VEZ aquí
             bg_image_ready = cv2.resize(bg_raw, (w_orig, h_orig))
-        else:
-            print(f"Error cargando fondo: {args.bg_img}")
-    
+
+            # 1. Pre-calcular desenfoque para Light Wrap
+            k_wrap = (
+                args.light_wrap if args.light_wrap % 2 == 1 else args.light_wrap + 1
+            )
+            if k_wrap > 0:
+                bg_blurred_light_wrap = cv2.GaussianBlur(
+                    bg_image_ready, (k_wrap, k_wrap), 0
+                )
+
+            # 2. Pre-calcular estadísticas para Harmonize (Color Transfer)
+            if args.harmonize > 0:
+                bg_small = cv2.resize(bg_image_ready, (200, 200))
+                bg_lab = cv2.cvtColor(bg_small, cv2.COLOR_BGR2LAB).astype("float32")
+                bg_stats = cv2.meanStdDev(bg_lab)  # Guarda (mean, std)
+
     if bg_image_ready is None:
         bg_image_ready = np.zeros_like(frame_ref)
 
     # Variables de estado
     previous_mask_stable = None
     last_raw_mask = None  # Para frame skipping
-    
-    morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.morph, args.morph)) if args.morph > 0 else None
+
+    morph_kernel = (
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.morph, args.morph))
+        if args.morph > 0
+        else None
+    )
     use_guided = args.guided and HAS_GUIDED_FILTER
-    
+
     # Manager
     fm = FrameManager(args.frame_skip, args.skip_non_essential)
     print(f"SYSTEM ONLINE. FrameSkip: {args.frame_skip}")
 
     while True:
         frame = vs.read()
-        if frame is None: break
-        
+        if frame is None:
+            break
+
         fm.update()
-        do_inference = fm.should_run_inference()
         do_effects = fm.should_run_effects()
+        do_inference = fm.should_run_inference()
 
         # 1. Armonización (Solo si toca efectos o si es frame completo)
         # Nota: La armonización depende del frame actual, si la cámara se mueve mucho
         # y saltamos esto, se verá raro. Pero para rendimiento extremo, se salta.
-        if args.harmonize > 0 and do_effects:
-             # Usamos una versión pequeña del fondo para calcular estadística
-             bg_small = cv2.resize(bg_image_ready, (200, 200))
-             frame_proc = color_transfer(frame, bg_small, args.harmonize)
+        if args.harmonize > 0 and do_effects and bg_stats:
+            # Aquí podrías optimizar color_transfer para recibir bg_stats directamente
+            frame_proc = color_transfer(frame, bg_stats, args.harmonize)
         else:
             frame_proc = frame
 
         # 2. Inferencia (CONTROLADA POR FRAME SKIP)
-        work_w, work_h = (max(160, int(w_orig * args.scale)), max(90, int(h_orig * args.scale)))
-        
+        work_w, work_h = (
+            max(160, int(w_orig * args.scale)),
+            max(90, int(h_orig * args.scale)),
+        )
+
         if do_inference or last_raw_mask is None:
             # Solo ejecutamos la IA si toca
             frame_infer = cv2.resize(frame, (work_w, work_h))
             raw_mask = engine.process(frame_infer)
-            last_raw_mask = raw_mask # Guardamos para el siguiente skip
+            last_raw_mask = raw_mask  # Guardamos para el siguiente skip
         else:
             # Reutilizamos la máscara del frame anterior
             raw_mask = last_raw_mask
 
         # 3. Estabilidad Temporal
-        if previous_mask_stable is None: previous_mask_stable = raw_mask
-        
+        if previous_mask_stable is None:
+            previous_mask_stable = raw_mask
+
         # Incluso si saltamos inferencia, aplicamos el suavizado temporal
         # para que la transición no sea tan brusca si el objeto se movió
-        mask_stable = (raw_mask * (1 - args.temporal)) + (previous_mask_stable * args.temporal)
+        mask_stable = (raw_mask * (1 - args.temporal)) + (
+            previous_mask_stable * args.temporal
+        )
         previous_mask_stable = mask_stable
 
         # 4. Refinado
@@ -266,45 +324,65 @@ def main():
 
         if morph_kernel is not None:
             _, mb = cv2.threshold(mask_sigmoid, 0.5, 1.0, cv2.THRESH_BINARY)
-            mask_morph = cv2.morphologyEx((mb * 255).astype(np.uint8), cv2.MORPH_CLOSE, morph_kernel)
-            mask_base = cv2.morphologyEx(mask_morph, cv2.MORPH_OPEN, morph_kernel).astype(np.float32) / 255.0
+            mask_morph = cv2.morphologyEx(
+                (mb * 255).astype(np.uint8), cv2.MORPH_CLOSE, morph_kernel
+            )
+            mask_base = (
+                cv2.morphologyEx(mask_morph, cv2.MORPH_OPEN, morph_kernel).astype(
+                    np.float32
+                )
+                / 255.0
+            )
         else:
             mask_base = mask_sigmoid
 
         # OPTIMIZACIÓN: Upscaling LINEAR (Mucho más rápido que LANCZOS4)
-        mask_hd = cv2.resize(mask_base, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+        mask_hd = cv2.resize(
+            mask_base, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR
+        )
 
-        if use_guided and do_effects: # Guided filter es pesado, se puede saltar
-            mask_final = cv2.ximgproc.guidedFilter(guide=frame_proc, src=mask_hd, radius=args.blur, eps=1e-6)
+        if use_guided and do_effects:  # Guided filter es pesado, se puede saltar
+            mask_final = cv2.ximgproc.guidedFilter(
+                guide=frame_proc, src=mask_hd, radius=args.blur, eps=1e-6
+            )
         else:
             k = args.blur if args.blur % 2 == 1 else args.blur + 1
-            mask_final = cv2.GaussianBlur(mask_hd, (k, k), 0) if args.blur > 0 else mask_hd
+            mask_final = (
+                cv2.GaussianBlur(mask_hd, (k, k), 0) if args.blur > 0 else mask_hd
+            )
 
         # 5. Composición
         mask_final = np.clip(mask_final, 0, 1)
         mask_3d = np.stack((mask_final,) * 3, axis=-1)
 
         # Light Wrap controlado por el manager
-        if args.light_wrap > 0 and do_effects:
-            frame_to_compose = apply_light_wrap(frame_proc, bg_image_ready, mask_final, args.light_wrap)
+        if args.light_wrap > 0 and do_effects and bg_blurred_light_wrap is not None:
+            frame_to_compose = apply_light_wrap(
+                frame_proc, bg_blurred_light_wrap, mask_final, args.light_wrap
+            )
         else:
             frame_to_compose = frame_proc
 
         # Usamos bg_image_ready que YA tiene el tamaño correcto (sin resize en bucle)
-        final_image = cv2.multiply(frame_to_compose, mask_3d, dtype=cv2.CV_8U) + \
-                      cv2.multiply(bg_image_ready, 1.0 - mask_3d, dtype=cv2.CV_8U)
+        final_image = cv2.multiply(
+            frame_to_compose, mask_3d, dtype=cv2.CV_8U
+        ) + cv2.multiply(bg_image_ready, 1.0 - mask_3d, dtype=cv2.CV_8U)
 
         cv2.imshow("VBG", final_image)
         if cam_out:
             cam_out.send(final_image)
             cam_out.sleep_until_next_frame()
 
-        if cv2.waitKey(1) & 0xFF == ord("q"): break
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
     vs.stop()
-    if cam_out: cam_out.close()
+    if cam_out:
+        cam_out.close()
     engine.close()
     cv2.destroyAllWindows()
 
+
 if __name__ == "__main__":
     main()
+
