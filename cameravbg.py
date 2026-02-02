@@ -6,9 +6,9 @@ import time
 
 import cv2
 import numpy as np
+from numba import float32, njit, prange, uint8, vectorize
 
 # --- CONFIGURACIÓN E IMPORTACIONES ---
-
 
 try:
     import mediapipe as mp
@@ -33,8 +33,8 @@ try:
 except AttributeError:
     HAS_GUIDED_FILTER = False
 
-
 # --- CLASES ---
+
 
 class WebcamStream:
     def __init__(self, src=0):
@@ -43,6 +43,7 @@ class WebcamStream:
         self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         (self.grabbed, self.frame) = self.stream.read()
         self.stopped = False
+        self.lock = threading.Lock()
 
     def start(self):
         threading.Thread(target=self.update, args=(), daemon=True).start()
@@ -52,10 +53,13 @@ class WebcamStream:
         while True:
             if self.stopped:
                 return
-            (self.grabbed, self.frame) = self.stream.read()
+            grabbed, frame = self.stream.read()
+            with self.lock:
+                self.grabbed, self.frame = grabbed, frame
 
     def read(self):
-        return self.frame
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
 
     def stop(self):
         self.stopped = True
@@ -96,35 +100,27 @@ class FrameManager:
         self.frame_counter += 1
 
     def should_run_inference(self):
-        """Devuelve True si se debe ejecutar la IA en este frame"""
         if self.frame_skip <= 0:
             return True
-        # Si frame_skip es 2: Ejecuta en 0, 2, 4... (Salta 1)
-        # Si frame_skip es 3: Ejecuta en 0, 3, 6... (Salta 2)
-        return (self.frame_counter % self.frame_skip) == 0
+        return (self.frame_counter % (self.frame_skip + 1)) == 0
 
     def should_run_effects(self):
-        """Devuelve True si se deben ejecutar efectos pesados (LightWrap, etc)"""
         if not self.skip_non_essential:
             return True
-        # Si estamos saltando inferencia, también saltamos efectos pesados
-        # para maximizar FPS en los frames intermedios
         return self.should_run_inference()
 
 
 class ProcessingPipeline:
-    """Pipeline de procesamiento multi-hilo para optimización de rendimiento"""
-
     def __init__(self, num_workers=2):
-        self.task_queue = queue.Queue(maxsize=2)
-        self.result_queue = queue.Queue(maxsize=2)
+        self.task_queue = queue.Queue(maxsize=num_workers * 2)
+        self.result_queue = queue.Queue(maxsize=num_workers * 2)
         self.workers = []
         self.shutdown_flag = False
         self.num_workers = num_workers
+        self.task_counter = 0
         self._setup_workers()
 
     def _setup_workers(self):
-        """Inicializa los workers del thread pool"""
         for i in range(self.num_workers):
             worker = threading.Thread(
                 target=self._worker_loop,
@@ -136,21 +132,16 @@ class ProcessingPipeline:
             self.workers.append(worker)
 
     def _worker_loop(self, worker_id):
-        """Bucle principal de los workers"""
         while not self.shutdown_flag:
             try:
                 task_func, task_args, task_id = self.task_queue.get(timeout=0.1)
-
-                # Ejecutar la tarea
                 try:
                     result = task_func(*task_args)
                     self.result_queue.put((task_id, result))
                 except Exception as e:
                     print(f"Worker {worker_id} error: {e}")
                     self.result_queue.put((task_id, None))
-
                 self.task_queue.task_done()
-
             except queue.Empty:
                 continue
             except Exception as e:
@@ -158,20 +149,17 @@ class ProcessingPipeline:
                 break
 
     def submit_task(self, task_func, task_args, task_id=None):
-        """Envía una tarea al pipeline"""
         if task_id is None:
-            task_id = f"task_{time.time()}_{len(self.workers)}"
+            task_id = f"task_{time.time()}_{self.task_counter}"
+            self.task_counter += 1
 
         try:
             self.task_queue.put((task_func, task_args, task_id), timeout=0.01)
             return task_id
         except queue.Full:
-            # Si la cola está llena, ejecutamos en el hilo principal 
-            # para evitar bloqueos
             return self._execute_in_main_thread(task_func, task_args, task_id)
 
     def _execute_in_main_thread(self, task_func, task_args, task_id):
-        """Ejecuta tarea en hilo principal si el pipeline está saturado"""
         try:
             result = task_func(*task_args)
             self.result_queue.put((task_id, result))
@@ -181,34 +169,25 @@ class ProcessingPipeline:
             self.result_queue.put((task_id, None))
             return task_id
 
-    def collect_result(self, task_id, timeout=0.5):
-        """Recoge el resultado de una tarea"""
-        try:
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if not self.result_queue.empty():
-                    result_task_id, result = self.result_queue.get()
-                    if result_task_id == task_id:
-                        return result
-                    else:
-                        # Si no es el resultado que buscamos, lo volvemos a poner
-                        # en la cola
-                        self.result_queue.put((result_task_id, result))
-                time.sleep(0.01)
-            return None
-        except Exception as e:
-            print(f"Error collecting result: {e}")
-            return None
+    def collect_result(self, task_id, timeout=0.1):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                result_task_id, result = self.result_queue.get_nowait()
+                if result_task_id == task_id:
+                    return result
+                else:
+                    self.result_queue.put((result_task_id, result))
+            except queue.Empty:
+                time.sleep(0.001)
+        return None
 
     def shutdown(self):
-        """Apaga el pipeline gracefulmente"""
         self.shutdown_flag = True
-        # Esperar a que los workers terminen
         for worker in self.workers:
             worker.join(timeout=1.0)
 
     def get_worker_status(self):
-        """Información de depuración sobre los workers"""
         return {
             "active_workers": len([w for w in self.workers if w.is_alive()]),
             "task_queue_size": self.task_queue.qsize(),
@@ -219,16 +198,41 @@ class ProcessingPipeline:
 # --- FUNCIONES AUXILIARES ---
 
 
+def safe_collect_result(pipeline, task_id, default_value):
+    """Recoge resultados de manera segura evitando errores con arrays"""
+    if pipeline is None:
+        return default_value
+
+    result = pipeline.collect_result(task_id)
+    if result is None:
+        return default_value
+
+    # Verificar que el resultado sea válido
+    if hasattr(result, "shape") and len(result.shape) > 0 and result.size > 0:
+        return result
+    else:
+        return default_value
+
+
 def color_transfer(source, target_stats, intensity=0.3):
     """
     source: Frame de la cámara (uint8 BGR)
     target_stats: Tupla (mean, std) pre-calculada del fondo en espacio LAB
     """
+    if target_stats is None:
+        return source
+
     (l_mean_tar, l_std_tar) = target_stats
 
     # Convertimos solo el frame actual a LAB
     source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
     (l_mean_src, l_std_src) = cv2.meanStdDev(source_lab)
+
+    # Asegurarse de que las dimensiones sean correctas
+    l_mean_src = l_mean_src.flatten()
+    l_std_src = l_std_src.flatten()
+    l_mean_tar = l_mean_tar.flatten()
+    l_std_tar = l_std_tar.flatten()
 
     l, a, b = cv2.split(source_lab)
 
@@ -239,7 +243,6 @@ def color_transfer(source, target_stats, intensity=0.3):
         return np.clip(new_ch, 0, 255)
 
     # Aplicamos el escalado solo a los canales A y B (el color)
-    # El canal L (luminosidad) lo dejamos intacto o lo escalamos suavemente si prefieres
     a_new = scale_channel(a, l_mean_src[1], l_std_src[1], l_mean_tar[1], l_std_tar[1])
     b_new = scale_channel(b, l_mean_src[2], l_std_src[2], l_mean_tar[2], l_std_tar[2])
 
@@ -251,14 +254,13 @@ def color_transfer(source, target_stats, intensity=0.3):
     return cv2.cvtColor(merged.astype("uint8"), cv2.COLOR_LAB2BGR)
 
 
+@vectorize([float32(float32, float32, float32)], target="parallel")
 def sigmoid(x, slope, shift):
-    return 1 / (1 + np.exp(-slope * (x - shift)))
+    return 1.0 / (1.0 + np.exp(-slope * (x - shift)))
 
 
 def wait_for_camera_ready(vs, max_attempts=10):
     time.sleep(0.5)
-    attempt = 0
-
     for attempt in range(max_attempts):
         frame = vs.read()
         if frame is not None and frame.size > 0:
@@ -267,7 +269,6 @@ def wait_for_camera_ready(vs, max_attempts=10):
                 print(f"Cámara lista: {w}x{h}")
                 return True
         time.sleep(0.2)
-        attempt = attempt + 1
     return False
 
 
@@ -275,14 +276,12 @@ def apply_light_wrap(foreground, bg_blurred, mask, radius=20):
     mask_inv = 1.0 - mask
     k = radius if radius % 2 == 1 else radius + 1
 
-    # El desenfoque de la máscara SÍ debe ser interno porque la máscara cambia
     mask_inv_blurred = cv2.GaussianBlur(mask_inv, (k, k), 0)
     wrap_map = mask * mask_inv_blurred
 
     if len(wrap_map.shape) == 2:
         wrap_map = wrap_map[:, :, np.newaxis]
 
-    # Usamos bg_blurred que ya viene procesado de afuera
     return (
         foreground.astype(np.float32) * (1.0 - wrap_map)
         + bg_blurred.astype(np.float32) * wrap_map
@@ -290,7 +289,6 @@ def apply_light_wrap(foreground, bg_blurred, mask, radius=20):
 
 
 def guided_filter_task(frame_proc, mask_hd, blur_radius):
-    """Tarea paralela para guided filter con manejo de errores"""
     try:
         if blur_radius > 0:
             return cv2.ximgproc.guidedFilter(
@@ -303,7 +301,6 @@ def guided_filter_task(frame_proc, mask_hd, blur_radius):
 
 
 def light_wrap_task(frame_proc, bg_blurred, mask_final, radius):
-    """Tarea paralela para light wrap con manejo de errores"""
     try:
         if radius > 0 and bg_blurred is not None:
             return apply_light_wrap(frame_proc, bg_blurred, mask_final, radius)
@@ -314,13 +311,10 @@ def light_wrap_task(frame_proc, bg_blurred, mask_final, radius):
 
 
 def morph_operations_task(mask_sigmoid, morph_kernel):
-    """Tarea paralela para operaciones morfológicas con manejo de errores"""
     try:
         if morph_kernel is not None:
-            _, mb = cv2.threshold(mask_sigmoid, 0.5, 1.0, cv2.THRESH_BINARY)
-            mask_morph = cv2.morphologyEx(
-                (mb * 255).astype(np.uint8), cv2.MORPH_CLOSE, morph_kernel
-            )
+            mask_binary = (mask_sigmoid > 0.5).astype(np.uint8) * 255
+            mask_morph = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, morph_kernel)
             return (
                 cv2.morphologyEx(mask_morph, cv2.MORPH_OPEN, morph_kernel).astype(
                     np.float32
@@ -331,6 +325,20 @@ def morph_operations_task(mask_sigmoid, morph_kernel):
     except Exception as e:
         print(f"Morph operations error: {e}")
         return mask_sigmoid
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def optimized_blend(fg, bg, mask):
+    h, w, c = fg.shape
+    out = np.empty((h, w, c), dtype=np.uint8)
+    inv_mask = 1.0 - mask
+    for i in prange(h):
+        for j in range(w):
+            m = mask[i, j]
+            inv_m = inv_mask[i, j]
+            for k in range(c):
+                out[i, j, k] = uint8(fg[i, j, k] * m + bg[i, j, k] * inv_m)
+    return out
 
 
 # --- CLI ---
@@ -355,7 +363,7 @@ parser.add_argument(
     "--multi_thread",
     type=int,
     default=0,
-    help="Procesamiento multi-hilo (0=desactivado, 2=2 workers, 4=4 workers)",
+    help="Multi-hilo (0=desactivado, 2=2 workers, 4=4 workers)",
 )
 
 args = parser.parse_args()
@@ -364,6 +372,7 @@ args = parser.parse_args()
 def main():
     if not HAS_MEDIAPIPE:
         return
+
     try:
         engine = MediaPipeEngine(args.model_path)
     except Exception as e:
@@ -376,19 +385,27 @@ def main():
         print("Fallo al iniciar cámara")
         return
 
-    # Obtener dimensiones reales
     frame_ref = vs.read()
     h_orig, w_orig = frame_ref.shape[:2]
 
-    # VCam
     cam_out = None
-    if args.virtual and HAS_VIRTUAL_CAM:
-        cam_out = pyvirtualcam.Camera(
-            width=w_orig, height=h_orig, fps=30, fmt=pyvirtualcam.PixelFormat.BGR
-        )
-        print("--> VIRTUAL CAM ACTIVA")
+    if args.virtual:
+        if HAS_VIRTUAL_CAM:
+            try:
+                cam_out = pyvirtualcam.Camera(
+                    width=w_orig,
+                    height=h_orig,
+                    fps=30,
+                    fmt=pyvirtualcam.PixelFormat.BGR,
+                )
+                print("--> VIRTUAL CAM ACTIVA (BGR)")
+            except Exception as e:
+                print(f"Error al inicializar cámara virtual: {e}")
+                cam_out = None
+        else:
+            print("Advertencia: PyVirtualCam no está instalado")
+            cam_out = None
 
-    # --- PREPARACIÓN DE FONDO OPTIMIZADA ---
     bg_image_ready = None
     bg_blurred_light_wrap = None
     bg_stats = None
@@ -397,8 +414,6 @@ def main():
         bg_raw = cv2.imread(args.bg_img)
         if bg_raw is not None:
             bg_image_ready = cv2.resize(bg_raw, (w_orig, h_orig))
-
-            # 1. Pre-calcular desenfoque para Light Wrap
             k_wrap = (
                 args.light_wrap if args.light_wrap % 2 == 1 else args.light_wrap + 1
             )
@@ -406,19 +421,34 @@ def main():
                 bg_blurred_light_wrap = cv2.GaussianBlur(
                     bg_image_ready, (k_wrap, k_wrap), 0
                 )
-
-            # 2. Pre-calcular estadísticas para Harmonize (Color Transfer)
             if args.harmonize > 0:
                 bg_small = cv2.resize(bg_image_ready, (200, 200))
                 bg_lab = cv2.cvtColor(bg_small, cv2.COLOR_BGR2LAB).astype("float32")
-                bg_stats = cv2.meanStdDev(bg_lab)  # Guarda (mean, std)
+                bg_stats = cv2.meanStdDev(bg_lab)
 
     if bg_image_ready is None:
         bg_image_ready = np.zeros_like(frame_ref)
 
-    # Variables de estado
+    # Configurar VSync para Qt (multiplataforma)
+    try:
+        import os
+
+        # Configuración multiplataforma para VSync
+        os.environ["QT_OPENGL"] = "angle"
+        os.environ["QT_OPENGL_SYNC"] = "1"
+        print("Configuración VSync multiplataforma aplicada")
+    except Exception as e:
+        print(f"Advertencia: No se pudo configurar VSync: {e}")
+
+    print("Calentando motores SIMD...")
+    dummy_f = np.zeros((100, 100, 3), dtype=np.uint8)
+    dummy_m = np.zeros((100, 100), dtype=np.float32)
+    _ = sigmoid(dummy_m, 12.0, 0.5)
+    _ = optimized_blend(dummy_f, dummy_f, dummy_m)
+    print("Sistemas listos.")
+
     previous_mask_stable = None
-    last_raw_mask = None  # Para frame skipping
+    last_raw_mask = None
 
     morph_kernel = (
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.morph, args.morph))
@@ -427,10 +457,8 @@ def main():
     )
     use_guided = args.guided and HAS_GUIDED_FILTER
 
-    # Manager
     fm = FrameManager(args.frame_skip, args.skip_non_essential)
 
-    # Inicializar pipeline multi-hilo si está activado
     pipeline = None
     if args.multi_thread > 0:
         pipeline = ProcessingPipeline(num_workers=args.multi_thread)
@@ -438,7 +466,6 @@ def main():
     else:
         print("Procesamiento single-threaded")
 
-    # Contador de FPS
     fps_counter = {
         "frame_count": 0,
         "last_time": time.time(),
@@ -447,6 +474,8 @@ def main():
     }
 
     print(f"SYSTEM ONLINE. FrameSkip: {args.frame_skip}")
+
+    k_wrap = args.light_wrap if args.light_wrap % 2 == 1 else args.light_wrap + 1
 
     while True:
         frame = vs.read()
@@ -457,64 +486,51 @@ def main():
         do_effects = fm.should_run_effects()
         do_inference = fm.should_run_inference()
 
-        # 1. Armonización (Solo si toca efectos o si es frame completo)
-        # Nota: La armonización depende del frame actual, si la cámara se mueve mucho
-        # y saltamos esto, se verá raro. Pero para rendimiento extremo, se salta.
         if args.harmonize > 0 and do_effects and bg_stats:
             if pipeline:
-                # Procesamiento paralelo
                 task_id = pipeline.submit_task(
                     color_transfer, (frame, bg_stats, args.harmonize)
                 )
-                result = pipeline.collect_result(task_id)
-                frame_proc = result if result is not None else frame
+                frame_proc = safe_collect_result(pipeline, task_id, frame)
             else:
-                # Procesamiento single-threaded
                 frame_proc = color_transfer(frame, bg_stats, args.harmonize)
         else:
             frame_proc = frame
 
-        # 2. Inferencia (CONTROLADA POR FRAME SKIP)
         work_w, work_h = (
             max(160, int(w_orig * args.scale)),
             max(90, int(h_orig * args.scale)),
         )
 
         if do_inference or last_raw_mask is None:
-            # Solo ejecutamos la IA si toca
             frame_infer = cv2.resize(frame, (work_w, work_h))
             raw_mask = engine.process(frame_infer)
-            last_raw_mask = raw_mask  # Guardamos para el siguiente skip
+            last_raw_mask = raw_mask
         else:
-            # Reutilizamos la máscara del frame anterior
             raw_mask = last_raw_mask
 
-        # 3. Estabilidad Temporal
         if previous_mask_stable is None:
             previous_mask_stable = raw_mask
 
-        # Incluso si saltamos inferencia, aplicamos el suavizado temporal
-        # para que la transición no sea tan brusca si el objeto se movió
         mask_stable = (raw_mask * (1 - args.temporal)) + (
             previous_mask_stable * args.temporal
         )
         previous_mask_stable = mask_stable
 
-        # 4. Refinado (con procesamiento paralelo)
-        mask_sigmoid = sigmoid(mask_stable, args.mask_contrast, 0.5)
+        mask_sigmoid = sigmoid(
+            mask_stable.astype(np.float32),
+            np.float32(args.mask_contrast),
+            np.float32(0.5),
+        )
 
         if pipeline and morph_kernel is not None and do_effects:
-            # Procesamiento paralelo de operaciones morfológicas
             morph_task = pipeline.submit_task(
                 morph_operations_task, (mask_sigmoid, morph_kernel)
             )
-            morph_result = pipeline.collect_result(morph_task)
-            mask_base = morph_result if morph_result is not None else mask_sigmoid
+            mask_base = safe_collect_result(pipeline, morph_task, mask_sigmoid)
         elif morph_kernel is not None:
-            _, mb = cv2.threshold(mask_sigmoid, 0.5, 1.0, cv2.THRESH_BINARY)
-            mask_morph = cv2.morphologyEx(
-                (mb * 255).astype(np.uint8), cv2.MORPH_CLOSE, morph_kernel
-            )
+            mask_binary = (mask_sigmoid > 0.5).astype(np.uint8) * 255
+            mask_morph = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, morph_kernel)
             mask_base = (
                 cv2.morphologyEx(mask_morph, cv2.MORPH_OPEN, morph_kernel).astype(
                     np.float32
@@ -524,17 +540,16 @@ def main():
         else:
             mask_base = mask_sigmoid
 
-        # OPTIMIZACIÓN: Upscaling LINEAR (Mucho más rápido que LANCZOS4)
         mask_hd = cv2.resize(
             mask_base, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR
         )
 
-        if pipeline and use_guided and do_effects:  # Guided filter paralelo
+        if pipeline and use_guided and do_effects:
             guided_task = pipeline.submit_task(
                 guided_filter_task, (frame_proc, mask_hd, args.blur)
             )
-            mask_final = pipeline.collect_result(guided_task) or mask_hd
-        elif use_guided and do_effects:  # Guided filter single-threaded
+            mask_final = safe_collect_result(pipeline, guided_task, mask_hd)
+        elif use_guided and do_effects:
             mask_final = cv2.ximgproc.guidedFilter(
                 guide=frame_proc, src=mask_hd, radius=args.blur, eps=1e-6
             )
@@ -544,11 +559,8 @@ def main():
                 cv2.GaussianBlur(mask_hd, (k, k), 0) if args.blur > 0 else mask_hd
             )
 
-        # 5. Composición
         mask_final = np.clip(mask_final, 0, 1)
-        mask_3d = np.stack((mask_final,) * 3, axis=-1)
 
-        # Light Wrap controlado por el manager (con procesamiento paralelo)
         if (
             pipeline
             and args.light_wrap > 0
@@ -559,7 +571,9 @@ def main():
                 light_wrap_task,
                 (frame_proc, bg_blurred_light_wrap, mask_final, args.light_wrap),
             )
-            frame_to_compose = pipeline.collect_result(light_wrap_task_id) or frame_proc
+            frame_to_compose = safe_collect_result(
+                pipeline, light_wrap_task_id, frame_proc
+            )
         elif args.light_wrap > 0 and do_effects and bg_blurred_light_wrap is not None:
             frame_to_compose = apply_light_wrap(
                 frame_proc, bg_blurred_light_wrap, mask_final, args.light_wrap
@@ -567,30 +581,20 @@ def main():
         else:
             frame_to_compose = frame_proc
 
-        # Usamos bg_image_ready que YA tiene el tamaño correcto (sin resize en bucle)
-        #final_image = cv2.multiply(
-        #    frame_to_compose, mask_3d, dtype=cv2.CV_8U
-        #) + cv2.multiply(bg_image_ready, 1.0 - mask_3d, dtype=cv2.CV_8U)
-        
-        final_image = (frame_to_compose * mask_3d + bg_image_ready * 
-                       (1.0 - mask_3d)).astype(np.uint8)
+        final_image = optimized_blend(frame_to_compose, bg_image_ready, mask_final)
 
-        # Actualizar contador de FPS
         fps_counter["frame_count"] += 1
         current_time = time.time()
         elapsed = current_time - fps_counter["last_time"]
 
-        if elapsed >= 1.0:  # Actualizar FPS cada segundo
+        if elapsed >= 1.0:
             fps_counter["current_fps"] = fps_counter["frame_count"] / elapsed
             fps_counter["fps_history"].append(fps_counter["current_fps"])
-            if (
-                len(fps_counter["fps_history"]) > 10
-            ):  # Mantener solo los últimos 10 valores
+            if len(fps_counter["fps_history"]) > 10:
                 fps_counter["fps_history"].pop(0)
             fps_counter["frame_count"] = 0
             fps_counter["last_time"] = current_time
 
-            # Mostrar FPS en consola (cada 5 segundos para no saturar)
             if len(fps_counter["fps_history"]) % 5 == 0:
                 avg_fps = sum(fps_counter["fps_history"]) / len(
                     fps_counter["fps_history"]
@@ -610,7 +614,6 @@ def main():
         cam_out.close()
     engine.close()
 
-    # Apagar pipeline multi-hilo si está activo
     if pipeline:
         pipeline.shutdown()
 
