@@ -166,7 +166,8 @@ class ProcessingPipeline:
             self.task_queue.put((task_func, task_args, task_id), timeout=0.01)
             return task_id
         except queue.Full:
-            # Si la cola está llena, ejecutamos en el hilo principal para evitar bloqueos
+            # Si la cola está llena, ejecutamos en el hilo principal 
+            # para evitar bloqueos
             return self._execute_in_main_thread(task_func, task_args, task_id)
 
     def _execute_in_main_thread(self, task_func, task_args, task_id):
@@ -190,7 +191,8 @@ class ProcessingPipeline:
                     if result_task_id == task_id:
                         return result
                     else:
-                        # Si no es el resultado que buscamos, lo volvemos a poner en la cola
+                        # Si no es el resultado que buscamos, lo volvemos a poner
+                        # en la cola
                         self.result_queue.put((result_task_id, result))
                 time.sleep(0.01)
             return None
@@ -570,7 +572,8 @@ def main():
         #    frame_to_compose, mask_3d, dtype=cv2.CV_8U
         #) + cv2.multiply(bg_image_ready, 1.0 - mask_3d, dtype=cv2.CV_8U)
         
-        final_image = (frame * mask_3d + bg_image_ready * (1.0 - mask_3d)).astype(np.uint8)
+        final_image = (frame_to_compose * mask_3d + bg_image_ready * 
+                       (1.0 - mask_3d)).astype(np.uint8)
 
         # Actualizar contador de FPS
         fps_counter["frame_count"] += 1
